@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["report", "blocking_findings"],
+  "properties": {
+    "report": { "type": "string", "description": "Full aggregated report of the code-review skill, in Markdown." },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["axis", "finding"],
+        "properties": {
+          "axis": { "type": "string", "enum": ["standards", "spec"] },
+          "finding": { "type": "string" }
+        }
+      }
+    }
+  }
+}
