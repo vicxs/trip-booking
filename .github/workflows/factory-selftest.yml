@@ -1,0 +1,51 @@
+# Tests and lints the software factory itself (docs/agents/factory.md).
+name: factory-selftest
+
+on:
+  pull_request:
+    paths:
+      - ".github/**"
+      - ".claude/skills/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - ".claude/skills/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: factory-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: node --test '.github/factory/test/*.test.mjs'
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          # actionlint 1.7.12 predates the `concurrency.queue` key (May 2026) and the
+          # `client-id` input of actions/create-github-app-token@v3; both are valid.
+          ./actionlint -color \
+            -ignore 'unexpected key "queue"' \
+            -ignore 'input "client-id" is not defined in action "actions/create-github-app-token@v3"' \
+            -ignore 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"'

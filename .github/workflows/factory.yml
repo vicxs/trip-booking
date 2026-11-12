@@ -1,0 +1,509 @@
+# Software factory: ready-for-agent issue -> implement -> verify -> review -> PR.
+# Flow, stage contracts, setup and operations: docs/agents/factory.md
+name: factory
+
+run-name: >-
+  ${{
+    github.event_name == 'schedule' && 'factory sweep' ||
+    (github.event_name == 'issues' && github.event.label.name != 'ready-for-agent') && format('factory · ignored label {0} on {1}', github.event.label.name, github.event.issue.number) ||
+    format('factory #{0} · {1}', inputs.issue || github.event.issue.number, inputs.stage || 'start')
+  }}
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number
+        required: true
+        type: number
+      stage:
+        description: "Stage to run from. `start` restarts from scratch on a fresh branch; the others resume on the existing agent branch."
+        required: true
+        type: choice
+        options: [start, implement, verify, review, pr]
+        default: start
+      from_run:
+        description: "Optional run id whose artifacts to carry (verify/review feedback for implement, approved review for pr)."
+        required: false
+        type: string
+        default: ""
+  schedule:
+    # Safety net: releases claims whose run died, and starts queued tickets when idle.
+    - cron: "17 * * * *"
+
+# Runs for one issue are serialized and queued, never cancelled. Label events
+# for other labels get a unique group so they never wait behind a real run.
+concurrency:
+  group: >-
+    ${{
+      github.event_name == 'schedule' && 'factory-sweep' ||
+      (github.event_name == 'issues' && github.event.label.name != 'ready-for-agent') && format('factory-ignored-{0}', github.run_id) ||
+      format('factory-issue-{0}', inputs.issue || github.event.issue.number)
+    }}
+  cancel-in-progress: false
+  queue: max
+
+# Every write goes through the factory's GitHub App token; the workflow token only reads.
+permissions:
+  contents: read
+
+env:
+  ISSUE: ${{ inputs.issue || github.event.issue.number }}
+
+jobs:
+  start:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issues' && github.event.label.name == 'ready-for-agent')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Claiming is serialized across issues: one ticket at a time.
+    concurrency:
+      group: factory-claim
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      proceed: ${{ steps.start.outputs.proceed }}
+      claimed: ${{ steps.start.outputs.claimed }}
+      stage: ${{ steps.start.outputs.stage }}
+      branch: ${{ steps.start.outputs.branch }}
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+      - if: inputs.from_run != ''
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ inputs.from_run }}
+          github-token: ${{ steps.token.outputs.token }}
+          path: ${{ env.FACTORY_DIR }}/carry
+      - id: start
+        run: node .github/factory/cli.mjs start
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          STAGE: ${{ inputs.stage || 'start' }}
+          FROM_RUN: ${{ inputs.from_run }}
+      # The factory code travels with the run so later jobs never execute
+      # scripts from the agent branch.
+      - if: steps.start.outputs.proceed == 'true'
+        run: cp -R .github/factory "$FACTORY_DIR/out/src"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: factory-state
+          path: ${{ env.FACTORY_DIR }}/out/
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  implement:
+    needs: start
+    if: needs.start.outputs.proceed == 'true' && needs.start.outputs.stage == 'implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.FACTORY_IMPLEMENT_TIMEOUT_MINUTES || '45') }}
+    env:
+      MAX_TURNS: ${{ vars.FACTORY_IMPLEMENT_MAX_TURNS || '80' }}
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.start.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ hashFiles('.nvmrc') != '' && '.nvmrc' || '' }}
+          node-version: ${{ hashFiles('.nvmrc') == '' && '24' || '' }}
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: factory-state
+          path: ${{ env.FACTORY_DIR }}/state
+      - id: ops
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - run: node "$FACTORY_DIR/state/src/cli.mjs" status implement running
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - id: agent-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+      - id: bot
+        run: |
+          slug='${{ steps.agent-token.outputs.app-slug }}'
+          {
+            echo "name=${slug}[bot]"
+            echo "id=$(gh api "/users/${slug}%5Bbot%5D" --jq .id)"
+            echo "base-sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          # Tooling the agent is likely to need; pnpm follows package.json when it pins one.
+          pm=$(node -p "try{require('./package.json').packageManager?.split('+')[0]||''}catch{''}")
+          npm install --global "${pm:-pnpm@latest}"
+        env:
+          GH_TOKEN: ${{ steps.agent-token.outputs.token }}
+      - id: prompt
+        run: node "$FACTORY_DIR/state/src/cli.mjs" prompt implement
+      - id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.agent-token.outputs.token }}
+          allowed_bots: ${{ steps.agent-token.outputs.app-slug }}
+          bot_name: ${{ steps.bot.outputs.name }}
+          bot_id: ${{ steps.bot.outputs.id }}
+          display_report: "true"
+          claude_args: >-
+            --max-turns ${{ env.MAX_TURNS }}
+            --permission-mode bypassPermissions
+            --add-dir ${{ env.FACTORY_DIR }}/state
+            --disallowedTools "Skill(code-review)"
+            ${{ vars.FACTORY_MODEL && format('--model {0}', vars.FACTORY_MODEL) || '' }}
+      - if: failure() && steps.agent.outcome == 'failure'
+        run: node "$FACTORY_DIR/state/src/cli.mjs" agent-outcome implement "$RUNNER_TEMP/claude-execution-output.json"
+      # Push even when the agent stopped early, so partial work stays on the branch for a human.
+      - if: always() && steps.bot.outcome == 'success'
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          node "$FACTORY_DIR/state/src/cli.mjs" push
+        env:
+          GH_TOKEN: ${{ steps.agent-token.outputs.token }}
+          BASE_SHA: ${{ steps.bot.outputs.base-sha }}
+      - if: always() && steps.ops.outcome == 'success'
+        run: node "$FACTORY_DIR/state/src/cli.mjs" status implement ${{ job.status }}
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: outcome-implement
+          path: ${{ env.FACTORY_DIR }}/out/reason.txt
+          if-no-files-found: ignore
+
+  verify:
+    needs: [start, implement]
+    if: >-
+      !cancelled() && needs.start.outputs.proceed == 'true' &&
+      (needs.implement.result == 'success' ||
+       (needs.implement.result == 'skipped' && contains(fromJSON('["verify","review","pr"]'), needs.start.outputs.stage)))
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.FACTORY_VERIFY_TIMEOUT_MINUTES || '30') }}
+    outputs:
+      passed: ${{ steps.verify.outputs.passed }}
+      head_sha: ${{ steps.verify.outputs.head_sha }}
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.start.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ hashFiles('.nvmrc') != '' && '.nvmrc' || '' }}
+          node-version: ${{ hashFiles('.nvmrc') == '' && '24' || '' }}
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: factory-state
+          path: ${{ env.FACTORY_DIR }}/state
+      - id: ops
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - run: node "$FACTORY_DIR/state/src/cli.mjs" status verify running
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - id: verify
+        run: node "$FACTORY_DIR/state/src/cli.mjs" verify
+      - if: always() && steps.ops.outcome == 'success'
+        run: >-
+          node "$FACTORY_DIR/state/src/cli.mjs" status verify
+          ${{ job.status == 'success' && (steps.verify.outputs.passed == 'true' && 'passed' || 'failed') || job.status }}
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify
+          path: |
+            ${{ env.FACTORY_DIR }}/out/result.json
+            ${{ env.FACTORY_DIR }}/out/verify.log
+            ${{ env.FACTORY_DIR }}/out/feedback.md
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: outcome-verify
+          path: ${{ env.FACTORY_DIR }}/out/reason.txt
+          if-no-files-found: ignore
+
+  review:
+    needs: [start, verify]
+    if: >-
+      !cancelled() && needs.start.outputs.proceed == 'true' &&
+      needs.verify.result == 'success' && needs.verify.outputs.passed == 'true' &&
+      needs.start.outputs.stage != 'pr'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.FACTORY_REVIEW_TIMEOUT_MINUTES || '20') }}
+    outputs:
+      verdict: ${{ steps.result.outputs.verdict }}
+    env:
+      MAX_TURNS: ${{ vars.FACTORY_REVIEW_MAX_TURNS || '40' }}
+      HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: factory-state
+          path: ${{ env.FACTORY_DIR }}/state
+      - id: ops
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-issues: write
+      - run: node "$FACTORY_DIR/state/src/cli.mjs" status review running
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      # The reviewer only reads: its token cannot write anything.
+      - id: agent-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-contents: read
+      - id: prompt
+        run: node "$FACTORY_DIR/state/src/cli.mjs" prompt review
+      - id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.agent-token.outputs.token }}
+          allowed_bots: ${{ steps.agent-token.outputs.app-slug }}
+          display_report: "true"
+          claude_args: >-
+            --max-turns ${{ env.MAX_TURNS }}
+            --permission-mode bypassPermissions
+            --add-dir ${{ env.FACTORY_DIR }}/state
+            --disallowedTools "Edit,Write,NotebookEdit"
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+            ${{ vars.FACTORY_MODEL && format('--model {0}', vars.FACTORY_MODEL) || '' }}
+      - if: failure() && steps.agent.outcome == 'failure'
+        run: node "$FACTORY_DIR/state/src/cli.mjs" agent-outcome review "$RUNNER_TEMP/claude-execution-output.json"
+      - id: result
+        run: node "$FACTORY_DIR/state/src/cli.mjs" review-result
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+      - if: always() && steps.ops.outcome == 'success'
+        run: >-
+          node "$FACTORY_DIR/state/src/cli.mjs" status review
+          ${{ job.status == 'success' && (steps.result.outputs.verdict == 'approve' && 'passed' || 'rework') || job.status }}
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: review
+          path: |
+            ${{ env.FACTORY_DIR }}/out/result.json
+            ${{ env.FACTORY_DIR }}/out/report.md
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: outcome-review
+          path: ${{ env.FACTORY_DIR }}/out/reason.txt
+          if-no-files-found: ignore
+
+  pr:
+    needs: [start, verify, review]
+    if: >-
+      !cancelled() && needs.start.outputs.proceed == 'true' &&
+      needs.verify.result == 'success' && needs.verify.outputs.passed == 'true' &&
+      ((needs.review.result == 'success' && needs.review.outputs.verdict == 'approve') ||
+       (needs.review.result == 'skipped' && needs.start.outputs.stage == 'pr'))
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.FACTORY_PR_TIMEOUT_MINUTES || '15') }}
+    outputs:
+      url: ${{ steps.open.outputs.url }}
+    env:
+      MAX_TURNS: ${{ vars.FACTORY_PR_MAX_TURNS || '20' }}
+      HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: factory-state
+          path: ${{ env.FACTORY_DIR }}/state
+      - uses: actions/download-artifact@v8
+        with:
+          name: verify
+          path: ${{ env.FACTORY_DIR }}/verify
+      # The approved review: from this run, or carried by `start` for a `pr` resume.
+      - if: needs.review.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: review
+          path: ${{ env.FACTORY_DIR }}/review
+      - if: needs.review.result == 'skipped'
+        run: cp -R "$FACTORY_DIR/state/review" "$FACTORY_DIR/review"
+      - id: ops
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-pull-requests: write
+      - run: node "$FACTORY_DIR/state/src/cli.mjs" status pr running
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - id: agent-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          permission-contents: read
+      - id: prompt
+        run: node "$FACTORY_DIR/state/src/cli.mjs" prompt pr
+      - id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.agent-token.outputs.token }}
+          allowed_bots: ${{ steps.agent-token.outputs.app-slug }}
+          display_report: "true"
+          claude_args: >-
+            --max-turns ${{ env.MAX_TURNS }}
+            --permission-mode bypassPermissions
+            --add-dir ${{ env.FACTORY_DIR }}
+            --disallowedTools "Edit,Write,NotebookEdit"
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+            ${{ vars.FACTORY_MODEL && format('--model {0}', vars.FACTORY_MODEL) || '' }}
+      - if: failure() && steps.agent.outcome == 'failure'
+        run: node "$FACTORY_DIR/state/src/cli.mjs" agent-outcome pr "$RUNNER_TEMP/claude-execution-output.json"
+      - id: open
+        run: node "$FACTORY_DIR/state/src/cli.mjs" open-pr
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+          STRUCTURED_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+      - if: always() && steps.ops.outcome == 'success'
+        run: node "$FACTORY_DIR/state/src/cli.mjs" status pr ${{ job.status }}
+        env:
+          GH_TOKEN: ${{ steps.ops.outputs.token }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: outcome-pr
+          path: ${{ env.FACTORY_DIR }}/out/reason.txt
+          if-no-files-found: ignore
+
+  # Always runs once the pipeline has started (including on failure, timeout or
+  # cancellation): continue with a rework run, finish with the PR, or hand the
+  # ticket to a human. A run never silently dies.
+  finish:
+    needs: [start, implement, verify, review, pr]
+    if: always() && (needs.start.result == 'failure' || needs.start.result == 'cancelled' || needs.start.outputs.proceed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      # Missing artifacts are expected when an early job crashed; decide anyway.
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          path: ${{ env.FACTORY_DIR }}/artifacts
+      - id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+      - id: decide
+        run: node .github/factory/cli.mjs finish-decide
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          FACTORY_VERIFY_RETRIES: ${{ vars.FACTORY_VERIFY_RETRIES }}
+          FACTORY_REVIEW_ROUNDS: ${{ vars.FACTORY_REVIEW_ROUNDS }}
+      # The next run reads its counters from this artifact (dispatched with from_run).
+      - if: steps.decide.outputs.action == 'continue'
+        uses: actions/upload-artifact@v7
+        with:
+          name: factory-next
+          path: ${{ env.FACTORY_DIR }}/out/state.json
+      - run: node .github/factory/cli.mjs finish-act
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CLAIMED: ${{ needs.start.outputs.claimed }}
+
+  sweep:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+      - run: node .github/factory/cli.mjs sweep
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}

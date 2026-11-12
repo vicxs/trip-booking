@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["body"],
+  "properties": {
+    "body": { "type": "string", "description": "The pull request body in Markdown, written with the pr skill." }
+  }
+}
