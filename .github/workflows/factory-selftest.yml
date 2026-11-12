@@ -43,5 +43,9 @@ jobs:
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          # actionlint 1.7.12 predates the `concurrency.queue` key (May 2026).
-          ./actionlint -color -ignore 'unexpected key "queue"'
+          # actionlint 1.7.12 predates the `concurrency.queue` key (May 2026) and the
+          # `client-id` input of actions/create-github-app-token@v3; both are valid.
+          ./actionlint -color \
+            -ignore 'unexpected key "queue"' \
+            -ignore 'input "client-id" is not defined in action "actions/create-github-app-token@v3"' \
+            -ignore 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"'

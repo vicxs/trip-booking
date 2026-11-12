@@ -67,9 +67,9 @@ jobs:
       claimed: ${{ steps.start.outputs.claimed }}
       stage: ${{ steps.start.outputs.stage }}
       branch: ${{ steps.start.outputs.branch }}
-    env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -113,9 +113,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.FACTORY_IMPLEMENT_TIMEOUT_MINUTES || '45') }}
     env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
       MAX_TURNS: ${{ vars.FACTORY_IMPLEMENT_MAX_TURNS || '80' }}
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.start.outputs.branch }}
@@ -149,9 +150,11 @@ jobs:
       - id: bot
         run: |
           slug='${{ steps.agent-token.outputs.app-slug }}'
-          echo "name=${slug}[bot]" >> "$GITHUB_OUTPUT"
-          echo "id=$(gh api "/users/${slug}%5Bbot%5D" --jq .id)" >> "$GITHUB_OUTPUT"
-          echo "base-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=${slug}[bot]"
+            echo "id=$(gh api "/users/${slug}%5Bbot%5D" --jq .id)"
+            echo "base-sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
           # Tooling the agent is likely to need; pnpm follows package.json when it pins one.
           pm=$(node -p "try{require('./package.json').packageManager?.split('+')[0]||''}catch{''}")
           npm install --global "${pm:-pnpm@latest}"
@@ -207,9 +210,9 @@ jobs:
     outputs:
       passed: ${{ steps.verify.outputs.passed }}
       head_sha: ${{ steps.verify.outputs.head_sha }}
-    env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.start.outputs.branch }}
@@ -268,10 +271,11 @@ jobs:
     outputs:
       verdict: ${{ steps.result.outputs.verdict }}
     env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
       MAX_TURNS: ${{ vars.FACTORY_REVIEW_MAX_TURNS || '40' }}
       HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.head_sha }}
@@ -357,10 +361,11 @@ jobs:
     outputs:
       url: ${{ steps.open.outputs.url }}
     env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
       MAX_TURNS: ${{ vars.FACTORY_PR_MAX_TURNS || '20' }}
       HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.verify.outputs.head_sha }}
@@ -445,9 +450,9 @@ jobs:
     if: always() && (needs.start.result == 'failure' || needs.start.result == 'cancelled' || needs.start.outputs.proceed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      FACTORY_DIR: ${{ runner.temp }}/factory
     steps:
+      # `runner` is not available in job-level env; export it for every later step.
+      - run: echo "FACTORY_DIR=$RUNNER_TEMP/factory" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
